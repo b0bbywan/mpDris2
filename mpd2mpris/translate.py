@@ -17,6 +17,7 @@ import contextlib
 import re
 from collections.abc import Iterable
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 from dbus_fast import Variant
 
@@ -28,6 +29,12 @@ _LIST_TAGS = frozenset({"artist", "albumartist", "composer", "genre"})
 # Default URL schemes recognised as "already a URL"; daemon overrides
 # this from MPD's ``urlhandlers`` command at startup when available.
 DEFAULT_URL_HANDLERS = ("http://", "https://", "mms://", "cdda://", "file://")
+
+# MPRIS track object paths: one per MPD queue entry, keyed by songid.
+TRACK_ID_PREFIX = "/org/mpris/MediaPlayer2/Track/"
+# TrackList sentinel: "no track" (start-of-queue for AddTrack, empty
+# CurrentTrack in TrackListReplaced).
+NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
 
 
 def _to_list(val: object) -> list[str]:
@@ -42,6 +49,24 @@ def first(val: object) -> str:
     if isinstance(val, list):
         return str(val[0]) if val else ""
     return str(val)
+
+
+def track_id(songid: object) -> str:
+    """MPD songid -> MPRIS track object path: ``12`` gives
+    ``/org/mpris/MediaPlayer2/Track/12``."""
+    return f"{TRACK_ID_PREFIX}{first(songid)}"
+
+
+def songid_from(trackid: str) -> int | None:
+    """MPRIS track object path -> MPD songid:
+    ``/org/mpris/MediaPlayer2/Track/12`` gives ``12``; ``NO_TRACK`` and
+    foreign paths give ``None``."""
+    if not trackid.startswith(TRACK_ID_PREFIX):
+        return None
+    try:
+        return int(trackid[len(TRACK_ID_PREFIX):])
+    except ValueError:
+        return None
 
 
 # Spaced dash between artist and track: ASCII hyphen, en-dash or em-dash.
@@ -151,6 +176,30 @@ def song_url(
     return (music_dir / file_uri).as_uri()
 
 
+def to_mpd_uri(
+    url: str,
+    music_dir: Path | None = None,
+    url_handlers: Iterable[str] = DEFAULT_URL_HANDLERS,
+) -> str:
+    """Inverse of ``song_url``: a MPRIS-facing URI -> something MPD's
+    ``add``/``addid`` accepts. ``file:///srv/music/a/b.flac`` with
+    ``music_dir=/srv/music`` gives the library-relative ``a/b.flac``;
+    ``http://stream`` passes through when MPD handles the scheme.
+    Returns ``""`` for what MPD can't play (a file outside the library,
+    an unhandled scheme)."""
+    if url.startswith("file://"):
+        if not music_dir:
+            return ""
+        path = Path(unquote(urlsplit(url).path))
+        try:
+            return path.relative_to(music_dir).as_posix()
+        except ValueError:
+            return ""
+    if any(url.startswith(h) for h in url_handlers if h != "file://"):
+        return url
+    return ""
+
+
 # --- currentsong() -> Metadata --------------------------------------------
 
 
@@ -197,7 +246,7 @@ def mpd_to_mpris(
 
     # --- identifiers --------------------------------------------------
     if "id" in song:
-        setv("mpris:trackid", "o", f"/org/mpris/MediaPlayer2/Track/{first(song['id'])}")
+        setv("mpris:trackid", "o", track_id(song["id"]))
 
     # --- duration -----------------------------------------------------
     # MPD has both ``time`` (seconds, deprecated) and ``duration``
