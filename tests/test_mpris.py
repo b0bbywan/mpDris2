@@ -11,7 +11,7 @@ from __future__ import annotations
 import pytest
 from dbus_fast.errors import DBusError
 
-from mpd2mpris.mpris import MediaPlayer2, MediaPlayer2Player
+from mpd2mpris.mpris import MediaPlayer2, MediaPlayer2Player, MediaPlayer2TrackList
 
 # dbus-fast `@dbus_property` rewrites the decorated function into a
 # regular attribute (the descriptor returns the stored value on read),
@@ -155,3 +155,64 @@ def test_invalid_loop_status_setter_raises() -> None:
     p = MediaPlayer2Player(on_loop_status_set=lambda v: None)
     with pytest.raises(DBusError):
         p.LoopStatus = "Garbage"  # type: ignore[misc, assignment]
+
+
+# --- MediaPlayer2TrackList --------------------------------------------------
+
+def test_tracklist_defaults() -> None:
+    tl = MediaPlayer2TrackList()
+    assert tl.Tracks == []
+    assert tl.CanEditTracks is True
+
+
+def test_tracklist_callbacks_fire() -> None:
+    calls: list[str] = []
+    tl = MediaPlayer2TrackList(
+        on_go_to=lambda tid: calls.append(f"goto:{tid}"),
+        on_add_track=lambda uri, after, cur: calls.append(f"add:{uri}:{after}:{cur}"),
+        on_remove_track=lambda tid: calls.append(f"remove:{tid}"),
+    )
+    tl.GoTo("/org/mpris/MediaPlayer2/Track/3")
+    tl.AddTrack("http://x/y.mp3", "/org/mpris/MediaPlayer2/TrackList/NoTrack", True)
+    tl.RemoveTrack("/org/mpris/MediaPlayer2/Track/3")
+    assert calls == [
+        "goto:/org/mpris/MediaPlayer2/Track/3",
+        "add:http://x/y.mp3:/org/mpris/MediaPlayer2/TrackList/NoTrack:True",
+        "remove:/org/mpris/MediaPlayer2/Track/3",
+    ]
+
+
+# dbus-fast's `@method` wrapper drops the return value when called
+# directly (the D-Bus dispatch uses the original function, kept in
+# ``__wrapped__``) — so returning methods are tested via ``__wrapped__``.
+
+def test_tracklist_get_tracks_metadata_dispatches() -> None:
+    tl = MediaPlayer2TrackList(
+        on_get_tracks_metadata=lambda ids: [{"asked": ids}],
+    )
+    ids = ["/org/mpris/MediaPlayer2/Track/1", "/org/mpris/MediaPlayer2/Track/2"]
+    assert tl.GetTracksMetadata.__wrapped__(tl, ids) == [{"asked": ids}]
+
+
+def test_tracklist_get_tracks_metadata_without_callback() -> None:
+    tl = MediaPlayer2TrackList()
+    assert tl.GetTracksMetadata.__wrapped__(
+        tl, ["/org/mpris/MediaPlayer2/Track/1"],
+    ) == []
+
+
+def test_tracklist_update_tracks() -> None:
+    tl = MediaPlayer2TrackList()
+    paths = ["/org/mpris/MediaPlayer2/Track/1", "/org/mpris/MediaPlayer2/Track/2"]
+    tl.update_tracks(paths)
+    assert tl.Tracks == paths
+    tl.update_tracks(paths)  # same value: no-op, still equal
+    assert tl.Tracks == paths
+
+
+def test_tracklist_update_can_edit() -> None:
+    tl = MediaPlayer2TrackList()
+    tl.update_can_edit(False)
+    assert tl.CanEditTracks is False
+    tl.update_can_edit(True)
+    assert tl.CanEditTracks is True
