@@ -1,11 +1,11 @@
 """MPRIS2 D-Bus interface, exposed via dbus-fast.
 
-Two ServiceInterface subclasses correspond to the two interfaces every
-MPRIS2 player must implement on the object path
-``/org/mpris/MediaPlayer2``:
+Three ServiceInterface subclasses correspond to the interfaces we
+implement on the object path ``/org/mpris/MediaPlayer2``:
 
-* ``org.mpris.MediaPlayer2``       — identity + capabilities (root)
-* ``org.mpris.MediaPlayer2.Player`` — playback state + controls
+* ``org.mpris.MediaPlayer2``           — identity + capabilities (root)
+* ``org.mpris.MediaPlayer2.Player``    — playback state + controls
+* ``org.mpris.MediaPlayer2.TrackList`` — the play queue (optional per spec)
 
 Behaviour is driven from the outside: callbacks injected at construction
 time handle Play/Pause/Stop/PlayPause/Next/Previous/Seek/SetPosition/
@@ -31,6 +31,7 @@ ROOT_PATH = "/org/mpris/MediaPlayer2"
 MEDIA_PLAYER_IFACE = "org.mpris.MediaPlayer2"
 BUS_NAME = f"{MEDIA_PLAYER_IFACE}.mpd"
 PLAYER_IFACE = f"{MEDIA_PLAYER_IFACE}.Player"
+TRACKLIST_IFACE = f"{MEDIA_PLAYER_IFACE}.TrackList"
 
 IDENTITY = "Music Player Daemon"
 
@@ -351,3 +352,102 @@ class MediaPlayer2Player(ServiceInterface):
     def emit_seeked(self, position_us: int) -> None:
         self._position = int(position_us)
         self.Seeked(int(position_us))
+
+
+class MediaPlayer2TrackList(ServiceInterface):
+    """TrackList MPRIS interface — the play queue as track object paths.
+
+    Like the Player interface, behaviour is injected: callbacks handle
+    GoTo/AddTrack/RemoveTrack/GetTracksMetadata, and the ``update_*`` /
+    ``emit_*`` methods push queue changes out to MPRIS clients."""
+
+    def __init__(
+        self,
+        on_go_to: Callable[[str], None] | None = None,
+        on_add_track: Callable[[str, str, bool], None] | None = None,
+        on_remove_track: Callable[[str], None] | None = None,
+        on_get_tracks_metadata: Callable[[list[str]], list[dict]] | None = None,
+    ) -> None:
+        super().__init__(TRACKLIST_IFACE)
+        self._tracks: list[str] = []
+        self._can_edit = True
+        self._on_go_to = on_go_to
+        self._on_add_track = on_add_track
+        self._on_remove_track = on_remove_track
+        self._on_get_tracks_metadata = on_get_tracks_metadata
+
+    # --- MPRIS methods ------------------------------------------------
+    @method()
+    def GetTracksMetadata(self, TrackIds: "ao") -> "aa{sv}":  # noqa: N802, N803
+        if self._on_get_tracks_metadata is None:
+            return []
+        return self._on_get_tracks_metadata([str(t) for t in TrackIds])
+
+    @method()
+    def AddTrack(self, Uri: "s", AfterTrack: "o", SetAsCurrent: "b"):  # noqa: N802, N803
+        if self._on_add_track:
+            self._on_add_track(str(Uri), str(AfterTrack), bool(SetAsCurrent))
+
+    @method()
+    def RemoveTrack(self, TrackId: "o"):  # noqa: N802, N803
+        if self._on_remove_track:
+            self._on_remove_track(str(TrackId))
+
+    @method()
+    def GoTo(self, TrackId: "o"):  # noqa: N802, N803
+        if self._on_go_to:
+            self._on_go_to(str(TrackId))
+
+    # --- MPRIS signals -------------------------------------------------
+    @signal()
+    def TrackListReplaced(self, Tracks: "ao", CurrentTrack: "o") -> "aoo":  # noqa: N802, N803
+        return [Tracks, CurrentTrack]
+
+    @signal()
+    def TrackAdded(self, Metadata: "a{sv}", AfterTrack: "o") -> "a{sv}o":  # noqa: N802, N803
+        return [Metadata, AfterTrack]
+
+    @signal()
+    def TrackRemoved(self, TrackId: "o") -> "o":  # noqa: N802, N803
+        return TrackId
+
+    @signal()
+    def TrackMetadataChanged(self, TrackId: "o", Metadata: "a{sv}") -> "oa{sv}":  # noqa: N802, N803
+        return [TrackId, Metadata]
+
+    # --- MPRIS properties ----------------------------------------------
+    @dbus_property(access=PropertyAccess.READ)
+    def Tracks(self) -> "ao":  # noqa: N802
+        return self._tracks
+
+    @dbus_property(access=PropertyAccess.READ)
+    def CanEditTracks(self) -> "b":  # noqa: N802
+        return self._can_edit
+
+    # --- External update API -------------------------------------------
+    def update_tracks(self, tracks: list[str]) -> None:
+        if tracks == self._tracks:
+            return
+        self._tracks = list(tracks)
+        # Spec: Tracks changes are announced invalidated-only (the list
+        # can be huge); the accompanying Track* signals carry the detail.
+        self.emit_properties_changed({}, ["Tracks"])
+
+    def update_can_edit(self, can_edit: bool) -> None:
+        can_edit = bool(can_edit)
+        if can_edit == self._can_edit:
+            return
+        self._can_edit = can_edit
+        self.emit_properties_changed({"CanEditTracks": can_edit})
+
+    def emit_track_list_replaced(self, current: str) -> None:
+        self.TrackListReplaced(self._tracks, current)
+
+    def emit_track_added(self, metadata: dict, after: str) -> None:
+        self.TrackAdded(metadata, after)
+
+    def emit_track_removed(self, trackid: str) -> None:
+        self.TrackRemoved(trackid)
+
+    def emit_track_metadata_changed(self, trackid: str, metadata: dict) -> None:
+        self.TrackMetadataChanged(trackid, metadata)
