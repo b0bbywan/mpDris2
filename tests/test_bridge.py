@@ -248,6 +248,7 @@ def _apply_bridge() -> MpdMprisBridge:
     bridge.music_dir = Path("/srv/music")
     bridge.url_handlers = ["http://"]
     bridge.player = MagicMock()
+    bridge.playlists = MagicMock()
     bridge._last_base = {}
     bridge._art = None
     bridge._cover_task = None
@@ -1093,3 +1094,127 @@ async def test_on_get_tracks_metadata_from_cached_queue() -> None:
     assert len(out) == 1
     assert out[0]["xesam:title"].value == "b"
     assert out[0]["mpris:trackid"].value == "/org/mpris/MediaPlayer2/Track/2"
+
+
+# --- Playlists ---------------------------------------------------------------
+
+
+def _playlists_bridge(*, stored: list[dict] | None = None, client=None):
+    bridge = MpdMprisBridge.__new__(MpdMprisBridge)
+    bridge.client = client if client is not None else MagicMock()
+    bridge.playlists = MagicMock()
+    bridge._stored_playlists = stored if stored is not None else []
+    return bridge
+
+
+_STORED = [
+    {"playlist": "rock", "last-modified": "2026-03-01T10:00:00Z"},
+    {"playlist": "Ambient", "last-modified": "2026-01-01T10:00:00Z"},
+    {"playlist": "jazz", "last-modified": "2026-02-01T10:00:00Z"},
+]
+
+
+def test_get_playlists_alphabetical_case_insensitive() -> None:
+    bridge = _playlists_bridge(stored=_STORED)
+    out = bridge.on_get_playlists(0, 10, "Alphabetical", False)
+    assert [e[1] for e in out] == ["Ambient", "jazz", "rock"]
+    assert out[0][0].startswith("/org/mpris/MediaPlayer2/Playlist/")
+    assert out[0][2] == ""  # no icon
+
+
+def test_get_playlists_modified_order() -> None:
+    bridge = _playlists_bridge(stored=_STORED)
+    out = bridge.on_get_playlists(0, 10, "Modified", False)
+    assert [e[1] for e in out] == ["Ambient", "jazz", "rock"]  # oldest first
+
+
+def test_get_playlists_reverse_and_slice() -> None:
+    bridge = _playlists_bridge(stored=_STORED)
+    out = bridge.on_get_playlists(1, 1, "Alphabetical", True)
+    # reversed: rock, jazz, Ambient -> index 1, max 1 -> jazz
+    assert [e[1] for e in out] == ["jazz"]
+
+
+def test_get_playlists_unknown_order_falls_back_to_alphabetical() -> None:
+    bridge = _playlists_bridge(stored=_STORED)
+    out = bridge.on_get_playlists(0, 10, "Played", False)
+    assert [e[1] for e in out] == ["Ambient", "jazz", "rock"]
+
+
+@pytest.mark.asyncio
+async def test_refresh_playlists_updates_count() -> None:
+    client = MagicMock()
+    client.listplaylists = AsyncMock(return_value=_STORED)
+    bridge = _playlists_bridge(client=client)
+    await bridge._refresh_playlists()
+    assert bridge._stored_playlists == _STORED
+    bridge.playlists.update_playlist_count.assert_called_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_refresh_playlists_keeps_cache_on_error() -> None:
+    client = MagicMock()
+    client.listplaylists = AsyncMock(side_effect=mpd.ConnectionError("lost"))
+    bridge = _playlists_bridge(stored=_STORED, client=client)
+    await bridge._refresh_playlists()
+    assert bridge._stored_playlists == _STORED
+    bridge.playlists.update_playlist_count.assert_not_called()
+
+
+def _activate_client():
+    c = MagicMock()
+    calls: list = []
+    for name in ("clear", "load", "play"):
+        async def cmd(*args, _name=name):
+            calls.append((_name, args))
+        setattr(c, name, cmd)
+    return c, calls
+
+
+@pytest.mark.asyncio
+async def test_on_playlist_activate_clears_loads_plays() -> None:
+    client, calls = _activate_client()
+    bridge = _playlists_bridge(stored=[{"playlist": "jazz 2024"}], client=client)
+    bridge._loop = asyncio.get_running_loop()
+    bridge.bg_tasks = set()
+    from mpd2mpris.translate import playlist_id
+    bridge.on_playlist_activate(playlist_id("jazz 2024"))
+    await _drain(bridge)
+    assert calls == [("clear", ()), ("load", ("jazz 2024",)), ("play", ())]
+
+
+@pytest.mark.asyncio
+async def test_on_playlist_activate_unknown_name_never_clears(caplog) -> None:
+    client, calls = _activate_client()
+    bridge = _playlists_bridge(stored=[{"playlist": "jazz"}], client=client)
+    bridge._loop = asyncio.get_running_loop()
+    bridge.bg_tasks = set()
+    from mpd2mpris.translate import playlist_id
+    with caplog.at_level(logging.WARNING):
+        bridge.on_playlist_activate(playlist_id("gone"))
+    assert calls == []
+    assert any("ActivatePlaylist" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_on_playlist_activate_foreign_path_is_noop() -> None:
+    client, calls = _activate_client()
+    bridge = _playlists_bridge(stored=[{"playlist": "jazz"}], client=client)
+    bridge.on_playlist_activate("/org/mpris/MediaPlayer2/Track/1")
+    assert calls == []
+
+
+def test_apply_updates_active_playlist_from_status() -> None:
+    bridge = _apply_bridge()
+    bridge._apply_current_state(
+        {"state": "play", "lastloadedplaylist": "jazz"}, {"id": "1"}, _snap(),
+    )
+    (arg,), _ = bridge.playlists.update_active_playlist.call_args
+    assert arg[1] == "jazz"
+    assert arg[0].startswith("/org/mpris/MediaPlayer2/Playlist/")
+
+
+def test_apply_no_last_loaded_playlist_is_inactive() -> None:
+    bridge = _apply_bridge()
+    bridge._apply_current_state({"state": "play"}, {"id": "1"}, _snap())
+    bridge.playlists.update_active_playlist.assert_called_once_with(None)

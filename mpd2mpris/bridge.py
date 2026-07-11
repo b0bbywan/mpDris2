@@ -37,6 +37,7 @@ from mpd2mpris.mpris import (
     ROOT_PATH,
     MediaPlayer2,
     MediaPlayer2Player,
+    MediaPlayer2Playlists,
     MediaPlayer2TrackList,
 )
 from mpd2mpris.translate import (
@@ -50,6 +51,8 @@ from mpd2mpris.translate import (
     parse_shuffle,
     parse_volume,
     playback_status_from,
+    playlist_id,
+    playlist_name_from,
     song_url,
     songid_from,
     to_mpd_uri,
@@ -58,8 +61,10 @@ from mpd2mpris.translate import (
 
 logger = logging.getLogger(__name__)
 
-# Subsystems we care about — others (e.g. ``database``, ``update``,
-# ``sticker``) don't influence the MPRIS-exposed state.
+# Subsystems that trigger a full status/song refresh — others (e.g.
+# ``database``, ``update``, ``sticker``) don't influence the
+# MPRIS-exposed state. ``stored_playlist`` is handled separately in
+# run_loop(): it only re-fetches the Playlists interface's list.
 WATCHED_SUBSYSTEMS = frozenset({"player", "mixer", "options", "playlist"})
 
 
@@ -182,6 +187,10 @@ class MpdMprisBridge:
         self._queue: list[dict] = []
         self._queue_version: str | None = None
 
+        # Playlists state: cached ``listplaylists`` result, re-fetched
+        # on connect and on idle ``stored_playlist`` events.
+        self._stored_playlists: list[dict] = []
+
         # Pre-resolved configuration (built in cli.py).
         self.host = config.host
         self.port = config.port
@@ -230,6 +239,10 @@ class MpdMprisBridge:
             on_add_track=self.on_tracklist_add,
             on_remove_track=self.on_tracklist_remove,
             on_get_tracks_metadata=self.on_get_tracks_metadata,
+        )
+        self.playlists = MediaPlayer2Playlists(
+            on_activate_playlist=self.on_playlist_activate,
+            on_get_playlists=self.on_get_playlists,
         )
 
     # --- Task / error plumbing ------------------------------------------
@@ -421,6 +434,57 @@ class MpdMprisBridge:
             if tid in by_path
         ]
 
+    # --- Playlists callbacks ----------------------------------------------
+
+    def on_get_playlists(
+        self, index: int, max_count: int, order: str, reverse: bool,
+    ) -> list:
+        entries = [
+            (first(p["playlist"]), first(p.get("last-modified", "")))
+            for p in self._stored_playlists
+            if p.get("playlist")
+        ]
+        if order == "Modified":
+            entries.sort(key=lambda e: e[1])  # ISO 8601 sorts lexicographically
+        else:  # "Alphabetical", and the sane default for unknown orderings
+            entries.sort(key=lambda e: e[0].casefold())
+        if reverse:
+            entries.reverse()
+        return [
+            [playlist_id(name), name, ""]
+            for name, _ in entries[index:index + max_count]
+        ]
+
+    def on_playlist_activate(self, playlist_path: str) -> None:
+        name = playlist_name_from(playlist_path)
+        c = self.client
+        if name is None or c is None:
+            return
+        # Only clear the queue for a playlist we know exists — a failed
+        # ``load`` after ``clear`` would wipe the queue for nothing.
+        if not any(first(p.get("playlist")) == name for p in self._stored_playlists):
+            logger.warning("ActivatePlaylist: unknown playlist %r; ignoring", name)
+            return
+
+        async def activate() -> None:
+            await self._mpd_safe(c.clear())
+            await self._mpd_safe(c.load(name))
+            await self._mpd_safe(c.play())
+
+        self._schedule(activate())
+
+    async def _refresh_playlists(self) -> None:
+        """Re-fetch MPD's stored playlists and push the count — on
+        connect and on idle ``stored_playlist`` events."""
+        c = self.client
+        if c is None:
+            return
+        pls = await self._mpd_safe(c.listplaylists())
+        if pls is None:
+            return
+        self._stored_playlists = list(pls)
+        self.playlists.update_playlist_count(len(self._stored_playlists))
+
     # --- Metadata + cover -----------------------------------------------
 
     def _with_art(self, base: dict[str, Variant]) -> dict[str, Variant]:
@@ -538,6 +602,13 @@ class MpdMprisBridge:
         if vol is not None:
             self.player.update_volume(vol)
 
+        # MPD >= 0.24 reports the last loaded stored playlist; older
+        # servers lack the key, leaving ActivePlaylist invalid.
+        pl_name = status.get("lastloadedplaylist", "")
+        self.playlists.update_active_playlist(
+            (playlist_id(pl_name), pl_name, "") if pl_name else None,
+        )
+
         self.player.update_position(int(snap.new_pos_s * 1_000_000))
 
         if (
@@ -650,6 +721,7 @@ class MpdMprisBridge:
         self.bus.export(ROOT_PATH, MediaPlayer2())
         self.bus.export(ROOT_PATH, self.player)
         self.bus.export(ROOT_PATH, self.tracklist)
+        self.bus.export(ROOT_PATH, self.playlists)
         await self.bus.request_name(BUS_NAME)
         logger.info("D-Bus name acquired: %s", BUS_NAME)
 
@@ -711,9 +783,12 @@ class MpdMprisBridge:
                 self.url_handlers = list(DEFAULT_URL_HANDLERS)
 
             await self.refresh()
+            await self._refresh_playlists()
 
             try:
                 async for subsystems in new_client.idle():
+                    if "stored_playlist" in subsystems:
+                        await self._refresh_playlists()
                     if WATCHED_SUBSYSTEMS.intersection(subsystems):
                         await self.refresh()
             except (mpd.ConnectionError, OSError) as e:
@@ -731,6 +806,7 @@ class MpdMprisBridge:
             self.player.update_metadata({})
             self._reset_cover_state()
             self._reset_tracklist_state()
+            self.playlists.update_active_playlist(None)
 
     async def close(self) -> None:
         """Drain in-flight tasks and release the bus name. The bus
