@@ -1,11 +1,12 @@
 """MPRIS2 D-Bus interface, exposed via dbus-fast.
 
-Three ServiceInterface subclasses correspond to the interfaces we
+Four ServiceInterface subclasses correspond to the interfaces we
 implement on the object path ``/org/mpris/MediaPlayer2``:
 
 * ``org.mpris.MediaPlayer2``           — identity + capabilities (root)
 * ``org.mpris.MediaPlayer2.Player``    — playback state + controls
 * ``org.mpris.MediaPlayer2.TrackList`` — the play queue (optional per spec)
+* ``org.mpris.MediaPlayer2.Playlists`` — stored playlists (optional per spec)
 
 Behaviour is driven from the outside: callbacks injected at construction
 time handle Play/Pause/Stop/PlayPause/Next/Previous/Seek/SetPosition/
@@ -32,6 +33,7 @@ MEDIA_PLAYER_IFACE = "org.mpris.MediaPlayer2"
 BUS_NAME = f"{MEDIA_PLAYER_IFACE}.mpd"
 PLAYER_IFACE = f"{MEDIA_PLAYER_IFACE}.Player"
 TRACKLIST_IFACE = f"{MEDIA_PLAYER_IFACE}.TrackList"
+PLAYLISTS_IFACE = f"{MEDIA_PLAYER_IFACE}.Playlists"
 
 IDENTITY = "Music Player Daemon"
 
@@ -452,3 +454,85 @@ class MediaPlayer2TrackList(ServiceInterface):
 
     def emit_track_metadata_changed(self, trackid: str, metadata: dict) -> None:
         self.TrackMetadataChanged(trackid, metadata)
+
+
+# MPRIS Playlist_Ordering values we can honour with what MPD's
+# ``listplaylists`` reports (name + last-modified).
+ORDERINGS = ["Alphabetical", "Modified"]
+
+# MaybePlaylist "invalid" convention: valid=False + a "/" path.
+INVALID_PLAYLIST = ["/", "", ""]
+
+
+class MediaPlayer2Playlists(ServiceInterface):
+    """Playlists MPRIS interface — MPD's stored playlists.
+
+    Same injected-callback pattern as the other interfaces:
+    ActivatePlaylist/GetPlaylists dispatch to the backend, ``update_*``
+    push count/active changes out to MPRIS clients."""
+
+    def __init__(
+        self,
+        on_activate_playlist: Callable[[str], None] | None = None,
+        on_get_playlists: Callable[[int, int, str, bool], list] | None = None,
+    ) -> None:
+        super().__init__(PLAYLISTS_IFACE)
+        self._count = 0
+        self._active: list = [False, list(INVALID_PLAYLIST)]
+        self._on_activate_playlist = on_activate_playlist
+        self._on_get_playlists = on_get_playlists
+
+    # --- MPRIS methods ------------------------------------------------
+    @method()
+    def ActivatePlaylist(self, PlaylistId: "o"):  # noqa: N802, N803
+        if self._on_activate_playlist:
+            self._on_activate_playlist(str(PlaylistId))
+
+    @method()
+    def GetPlaylists(  # noqa: N802
+        self,
+        Index: "u",  # noqa: N803
+        MaxCount: "u",  # noqa: N803
+        Order: "s",  # noqa: N803
+        ReverseOrder: "b",  # noqa: N803
+    ) -> "a(oss)":
+        if self._on_get_playlists is None:
+            return []
+        return self._on_get_playlists(
+            int(Index), int(MaxCount), str(Order), bool(ReverseOrder),
+        )
+
+    # --- MPRIS signals -------------------------------------------------
+    @signal()
+    def PlaylistChanged(self, Playlist: "(oss)") -> "(oss)":  # noqa: N802, N803
+        return Playlist
+
+    # --- MPRIS properties ----------------------------------------------
+    @dbus_property(access=PropertyAccess.READ)
+    def PlaylistCount(self) -> "u":  # noqa: N802
+        return self._count
+
+    @dbus_property(access=PropertyAccess.READ)
+    def Orderings(self) -> "as":  # noqa: N802
+        return list(ORDERINGS)
+
+    @dbus_property(access=PropertyAccess.READ)
+    def ActivePlaylist(self) -> "(b(oss))":  # noqa: N802
+        return self._active
+
+    # --- External update API -------------------------------------------
+    def update_playlist_count(self, count: int) -> None:
+        count = int(count)
+        if count == self._count:
+            return
+        self._count = count
+        self.emit_properties_changed({"PlaylistCount": count})
+
+    def update_active_playlist(self, playlist: tuple[str, str, str] | None) -> None:
+        """``playlist`` is ``(object path, name, icon)``; ``None`` means
+        no active playlist (MaybePlaylist valid=False)."""
+        active = [True, list(playlist)] if playlist else [False, list(INVALID_PLAYLIST)]
+        if active == self._active:
+            return
+        self._active = active
+        self.emit_properties_changed({"ActivePlaylist": active})

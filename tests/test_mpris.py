@@ -11,7 +11,12 @@ from __future__ import annotations
 import pytest
 from dbus_fast.errors import DBusError
 
-from mpd2mpris.mpris import MediaPlayer2, MediaPlayer2Player, MediaPlayer2TrackList
+from mpd2mpris.mpris import (
+    MediaPlayer2,
+    MediaPlayer2Player,
+    MediaPlayer2Playlists,
+    MediaPlayer2TrackList,
+)
 
 # dbus-fast `@dbus_property` rewrites the decorated function into a
 # regular attribute (the descriptor returns the stored value on read),
@@ -216,3 +221,48 @@ def test_tracklist_update_can_edit() -> None:
     assert tl.CanEditTracks is False
     tl.update_can_edit(True)
     assert tl.CanEditTracks is True
+
+
+# --- MediaPlayer2Playlists ---------------------------------------------------
+
+def test_playlists_defaults() -> None:
+    pl = MediaPlayer2Playlists()
+    assert pl.PlaylistCount == 0
+    assert pl.Orderings == ["Alphabetical", "Modified"]
+    assert pl.ActivePlaylist == [False, ["/", "", ""]]
+
+
+def test_playlists_activate_dispatches() -> None:
+    calls: list[str] = []
+    pl = MediaPlayer2Playlists(on_activate_playlist=calls.append)
+    pl.ActivatePlaylist("/org/mpris/MediaPlayer2/Playlist/jazz")
+    assert calls == ["/org/mpris/MediaPlayer2/Playlist/jazz"]
+
+
+def test_playlists_get_playlists_dispatches() -> None:
+    pl = MediaPlayer2Playlists(
+        on_get_playlists=lambda i, n, order, rev: [["/pl", f"{i}:{n}:{order}:{rev}", ""]],
+    )
+    out = pl.GetPlaylists.__wrapped__(pl, 5, 20, "Alphabetical", True)
+    assert out == [["/pl", "5:20:Alphabetical:True", ""]]
+
+
+def test_playlists_get_playlists_without_callback() -> None:
+    pl = MediaPlayer2Playlists()
+    assert pl.GetPlaylists.__wrapped__(pl, 0, 10, "Alphabetical", False) == []
+
+
+def test_playlists_update_count() -> None:
+    pl = MediaPlayer2Playlists()
+    pl.update_playlist_count(4)
+    assert pl.PlaylistCount == 4
+
+
+def test_playlists_update_active() -> None:
+    pl = MediaPlayer2Playlists()
+    pl.update_active_playlist(("/org/mpris/MediaPlayer2/Playlist/jazz", "jazz", ""))
+    assert pl.ActivePlaylist == [
+        True, ["/org/mpris/MediaPlayer2/Playlist/jazz", "jazz", ""],
+    ]
+    pl.update_active_playlist(None)
+    assert pl.ActivePlaylist == [False, ["/", "", ""]]
