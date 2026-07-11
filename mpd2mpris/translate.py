@@ -36,6 +36,11 @@ TRACK_ID_PREFIX = "/org/mpris/MediaPlayer2/Track/"
 # CurrentTrack in TrackListReplaced).
 NO_TRACK = "/org/mpris/MediaPlayer2/TrackList/NoTrack"
 
+# MPRIS playlist object paths, one per MPD stored playlist. D-Bus
+# object paths only allow ``[A-Za-z0-9_]`` per element, so the name is
+# hex-escaped (see ``playlist_id``).
+PLAYLIST_ID_PREFIX = "/org/mpris/MediaPlayer2/Playlist/"
+
 
 def _to_list(val: object) -> list[str]:
     if isinstance(val, list):
@@ -66,6 +71,49 @@ def songid_from(trackid: str) -> int | None:
     try:
         return int(trackid[len(TRACK_ID_PREFIX):])
     except ValueError:
+        return None
+
+
+def playlist_id(name: str) -> str:
+    """MPD playlist name -> MPRIS playlist object path: ``jazz 2024``
+    gives ``/org/mpris/MediaPlayer2/Playlist/jazz_202024``. ASCII
+    letters and digits pass through; every other UTF-8 byte (``_``
+    included) becomes ``_XX`` hex so the mapping is reversible."""
+    out = []
+    for b in name.encode("utf-8"):
+        if 0x30 <= b <= 0x39 or 0x41 <= b <= 0x5A or 0x61 <= b <= 0x7A:
+            out.append(chr(b))
+        else:
+            out.append(f"_{b:02X}")
+    return PLAYLIST_ID_PREFIX + "".join(out)
+
+
+def playlist_name_from(playlist_path: str) -> str | None:
+    """Inverse of ``playlist_id``:
+    ``/org/mpris/MediaPlayer2/Playlist/jazz_202024`` gives ``jazz 2024``.
+    Foreign or malformed paths (bad hex, invalid UTF-8) give ``None``."""
+    if not playlist_path.startswith(PLAYLIST_ID_PREFIX):
+        return None
+    encoded = playlist_path[len(PLAYLIST_ID_PREFIX):]
+    if not encoded:
+        return None
+    raw = bytearray()
+    i = 0
+    while i < len(encoded):
+        if encoded[i] == "_":
+            if i + 3 > len(encoded):
+                return None
+            try:
+                raw.append(int(encoded[i + 1:i + 3], 16))
+            except ValueError:
+                return None
+            i += 3
+        else:
+            raw.append(ord(encoded[i]))
+            i += 1
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
         return None
 
 
