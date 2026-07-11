@@ -119,4 +119,7 @@ def capabilities(commands: Iterable[str]) -> dict[str, bool]:
         "single": "single" in cmds,            # 0.15
         "albumart": "albumart" in cmds,        # 0.21
         "readpicture": "readpicture" in cmds,  # 0.22
+        # Queue editing (TrackList CanEditTracks) — read-only permission
+        # profiles expose none of these.
+        "queue_edit": {"addid", "deleteid", "playid"} <= cmds,
     }
