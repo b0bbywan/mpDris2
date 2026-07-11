@@ -17,6 +17,8 @@ from mpd2mpris.translate import (
     parse_shuffle,
     parse_volume,
     playback_status_from,
+    playlist_id,
+    playlist_name_from,
     song_url,
     songid_from,
     split_title,
@@ -354,3 +356,40 @@ def test_to_mpd_uri_roundtrips_song_url() -> None:
     song = {"file": "Artist/Album 01/Song #1.flac"}
     url = song_url(song, Path("/srv/music"), ["http://"])
     assert to_mpd_uri(url, Path("/srv/music"), ["http://"]) == song["file"]
+
+
+# --- playlist ids ------------------------------------------------------------
+
+@pytest.mark.parametrize("name", [
+    "jazz",
+    "jazz 2024",
+    "Été à Paris",          # multi-byte UTF-8
+    "under_score",          # "_" itself must escape reversibly
+    "100% dub!",
+])
+def test_playlist_id_roundtrip(name: str) -> None:
+    pid = playlist_id(name)
+    assert pid.startswith("/org/mpris/MediaPlayer2/Playlist/")
+    # Object-path-safe: only [A-Za-z0-9_] after the prefix
+    assert all(c.isascii() and (c.isalnum() or c == "_") for c in pid.rsplit("/", 1)[1])
+    assert playlist_name_from(pid) == name
+
+
+def test_playlist_name_from_foreign_path() -> None:
+    assert playlist_name_from("/org/mpris/MediaPlayer2/Track/1") is None
+
+
+def test_playlist_name_from_empty() -> None:
+    assert playlist_name_from("/org/mpris/MediaPlayer2/Playlist/") is None
+
+
+def test_playlist_name_from_truncated_hex() -> None:
+    assert playlist_name_from("/org/mpris/MediaPlayer2/Playlist/jazz_2") is None
+
+
+def test_playlist_name_from_bad_hex() -> None:
+    assert playlist_name_from("/org/mpris/MediaPlayer2/Playlist/jazz_ZZ") is None
+
+
+def test_playlist_name_from_invalid_utf8() -> None:
+    assert playlist_name_from("/org/mpris/MediaPlayer2/Playlist/_FF_FE") is None
