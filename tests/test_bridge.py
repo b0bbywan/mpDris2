@@ -19,9 +19,11 @@ from dbus_fast import Variant
 
 from mpd2mpris.bridge import (
     MpdMprisBridge,
+    _diff_queue,
     _is_external_seek,
     _RefreshSnapshot,
 )
+from mpd2mpris.translate import NO_TRACK
 
 
 def _cover_bridge(cover_finder, *, client=None):
@@ -765,3 +767,329 @@ async def test_refresh_swallows_connection_drop(caplog) -> None:
     with caplog.at_level(logging.WARNING):
         await bridge.refresh()
     assert any("MPD lost during refresh" in r.message for r in caplog.records)
+
+
+# --- _diff_queue -------------------------------------------------------------
+
+
+def test_diff_queue_append_at_end() -> None:
+    assert _diff_queue(["1", "2"], ["1", "2", "3"]) == ([("3", "2")], [])
+
+
+def test_diff_queue_insert_at_start() -> None:
+    assert _diff_queue(["1", "2"], ["3", "1", "2"]) == ([("3", None)], [])
+
+
+def test_diff_queue_removal() -> None:
+    assert _diff_queue(["1", "2", "3"], ["1", "3"]) == ([], ["2"])
+
+
+def test_diff_queue_add_and_remove_order_preserved() -> None:
+    added, removed = _diff_queue(["1", "2", "3"], ["1", "3", "4"])
+    assert removed == ["2"]
+    assert added == [("4", "3")]
+
+
+def test_diff_queue_consecutive_adds_chain_predecessors() -> None:
+    # Each new track's AfterTrack is the one emitted just before it.
+    added, removed = _diff_queue(["1"], ["1", "2", "3"])
+    assert removed == []
+    assert added == [("2", "1"), ("3", "2")]
+
+
+def test_diff_queue_no_change() -> None:
+    assert _diff_queue(["1", "2"], ["1", "2"]) == ([], [])
+
+
+def test_diff_queue_reorder_is_replace() -> None:
+    assert _diff_queue(["1", "2", "3"], ["3", "2", "1"]) is None
+
+
+def test_diff_queue_too_many_changes_is_replace() -> None:
+    old = [str(i) for i in range(5)]
+    new = [str(i) for i in range(100, 120)]
+    assert _diff_queue(old, new) is None
+
+
+def test_diff_queue_initial_small_population_is_adds() -> None:
+    assert _diff_queue([], ["1", "2"]) == ([("1", None), ("2", "1")], [])
+
+
+# --- _sync_tracklist ---------------------------------------------------------
+
+
+def _tracklist_bridge(*, queue: list[dict] | None = None):
+    """Bridge stub for the TrackList sync path: mocked tracklist iface,
+    real ``_sync_tracklist``."""
+    bridge = MpdMprisBridge.__new__(MpdMprisBridge)
+    bridge.client = MagicMock()
+    bridge.music_dir = Path("/srv/music")
+    bridge.url_handlers = ["http://"]
+    bridge.tracklist = MagicMock()
+    bridge._queue = queue if queue is not None else []
+    bridge._queue_version = None
+    return bridge
+
+
+def test_sync_tracklist_updates_tracks_property() -> None:
+    bridge = _tracklist_bridge()
+    bridge._sync_tracklist([{"id": "1", "title": "a"}, {"id": "2", "title": "b"}], {})
+    bridge.tracklist.update_tracks.assert_called_once_with([
+        "/org/mpris/MediaPlayer2/Track/1",
+        "/org/mpris/MediaPlayer2/Track/2",
+    ])
+
+
+def test_sync_tracklist_emits_added_with_metadata() -> None:
+    bridge = _tracklist_bridge(queue=[{"id": "1", "title": "a", "pos": "0"}])
+    bridge._sync_tracklist(
+        [{"id": "1", "title": "a", "pos": "0"},
+         {"id": "2", "title": "b", "pos": "1"}],
+        {},
+    )
+    (meta, after), _ = bridge.tracklist.emit_track_added.call_args
+    assert meta["xesam:title"].value == "b"
+    assert meta["mpris:trackid"].value == "/org/mpris/MediaPlayer2/Track/2"
+    assert after == "/org/mpris/MediaPlayer2/Track/1"
+    bridge.tracklist.emit_track_removed.assert_not_called()
+    bridge.tracklist.emit_track_list_replaced.assert_not_called()
+
+
+def test_sync_tracklist_first_add_is_after_no_track() -> None:
+    bridge = _tracklist_bridge()
+    bridge._sync_tracklist([{"id": "5", "title": "x"}], {})
+    (_, after), _ = bridge.tracklist.emit_track_added.call_args
+    assert after == NO_TRACK
+
+
+def test_sync_tracklist_emits_removed() -> None:
+    bridge = _tracklist_bridge(
+        queue=[{"id": "1", "title": "a", "pos": "0"},
+               {"id": "2", "title": "b", "pos": "1"}],
+    )
+    bridge._sync_tracklist([{"id": "2", "title": "b", "pos": "0"}], {})
+    bridge.tracklist.emit_track_removed.assert_called_once_with(
+        "/org/mpris/MediaPlayer2/Track/1")
+    bridge.tracklist.emit_track_added.assert_not_called()
+    # pos shifted 1 -> 0 but tags are identical: no metadata-changed signal
+    bridge.tracklist.emit_track_metadata_changed.assert_not_called()
+
+
+def test_sync_tracklist_reorder_emits_replaced_with_current() -> None:
+    bridge = _tracklist_bridge(
+        queue=[{"id": "1", "title": "a"}, {"id": "2", "title": "b"}],
+    )
+    bridge._sync_tracklist(
+        [{"id": "2", "title": "b"}, {"id": "1", "title": "a"}],
+        {"songid": "2"},
+    )
+    bridge.tracklist.emit_track_list_replaced.assert_called_once_with(
+        "/org/mpris/MediaPlayer2/Track/2")
+    bridge.tracklist.emit_track_added.assert_not_called()
+    bridge.tracklist.emit_track_removed.assert_not_called()
+
+
+def test_sync_tracklist_replaced_without_current_uses_no_track() -> None:
+    bridge = _tracklist_bridge(
+        queue=[{"id": str(i)} for i in range(20)],
+    )
+    bridge._sync_tracklist([{"id": str(i)} for i in range(100, 120)], {})
+    bridge.tracklist.emit_track_list_replaced.assert_called_once_with(NO_TRACK)
+
+
+def test_sync_tracklist_icy_title_change_emits_metadata_changed() -> None:
+    bridge = _tracklist_bridge(
+        queue=[{"id": "1", "file": "http://r/x.mp3", "title": "Old - Song", "pos": "0"}],
+    )
+    bridge._sync_tracklist(
+        [{"id": "1", "file": "http://r/x.mp3", "title": "New - Song", "pos": "0"}],
+        {},
+    )
+    (tid, meta), _ = bridge.tracklist.emit_track_metadata_changed.call_args
+    assert tid == "/org/mpris/MediaPlayer2/Track/1"
+    assert meta["xesam:title"].value == "New - Song"
+
+
+# --- _refresh_tracklist ------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_refresh_tracklist_skips_when_version_unchanged() -> None:
+    bridge = _tracklist_bridge()
+    bridge._queue_version = "12"
+    bridge.client.playlistinfo = AsyncMock()
+    await bridge._refresh_tracklist({"playlist": "12"})
+    bridge.client.playlistinfo.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tracklist_fetches_on_version_change() -> None:
+    bridge = _tracklist_bridge()
+    bridge._queue_version = "12"
+    bridge.client.playlistinfo = AsyncMock(return_value=[{"id": "1", "title": "a"}])
+    await bridge._refresh_tracklist({"playlist": "13"})
+    assert bridge._queue_version == "13"
+    assert bridge._queue == [{"id": "1", "title": "a"}]
+    bridge.tracklist.update_tracks.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tracklist_keeps_version_on_error() -> None:
+    # A failed playlistinfo must not advance the version, so the fetch is
+    # retried on the next refresh.
+    bridge = _tracklist_bridge()
+    bridge._queue_version = "12"
+    bridge.client.playlistinfo = AsyncMock(side_effect=mpd.ConnectionError("lost"))
+    await bridge._refresh_tracklist({"playlist": "13"})
+    assert bridge._queue_version == "12"
+    bridge.tracklist.update_tracks.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_refresh_tracklist_no_client_is_noop() -> None:
+    bridge = _tracklist_bridge()
+    bridge.client = None
+    await bridge._refresh_tracklist({"playlist": "1"})
+    bridge.tracklist.update_tracks.assert_not_called()
+
+
+def test_reset_tracklist_state_empties_queue() -> None:
+    bridge = _tracklist_bridge(queue=[{"id": "1"}])
+    bridge._queue_version = "3"
+    bridge._reset_tracklist_state()
+    assert bridge._queue == []
+    assert bridge._queue_version is None
+    bridge.tracklist.update_tracks.assert_called_once_with([])
+    bridge.tracklist.emit_track_list_replaced.assert_called_once_with(NO_TRACK)
+
+
+def test_reset_tracklist_state_already_empty_stays_silent() -> None:
+    bridge = _tracklist_bridge()
+    bridge._reset_tracklist_state()
+    bridge.tracklist.update_tracks.assert_not_called()
+    bridge.tracklist.emit_track_list_replaced.assert_not_called()
+
+
+# --- TrackList callbacks -----------------------------------------------------
+
+
+def _tracklist_client():
+    c = MagicMock()
+    for name in ("playid", "deleteid", "addid"):
+        setattr(c, name, AsyncMock())
+    c.addid.return_value = "9"
+    return c
+
+
+def _tracklist_callback_bridge(client, *, queue: list[dict] | None = None):
+    bridge = MpdMprisBridge.__new__(MpdMprisBridge)
+    bridge._loop = asyncio.get_running_loop()
+    bridge.bg_tasks = set()
+    bridge.client = client
+    bridge.music_dir = Path("/srv/music")
+    bridge.url_handlers = ["http://"]
+    bridge._queue = queue if queue is not None else []
+    return bridge
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_goto_plays_songid() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    bridge.on_tracklist_goto("/org/mpris/MediaPlayer2/Track/7")
+    await _drain(bridge)
+    client.playid.assert_awaited_once_with(7)
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_goto_foreign_path_is_noop() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    bridge.on_tracklist_goto(NO_TRACK)
+    await _drain(bridge)
+    client.playid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_remove_deletes_songid() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    bridge.on_tracklist_remove("/org/mpris/MediaPlayer2/Track/3")
+    await _drain(bridge)
+    client.deleteid.assert_awaited_once_with(3)
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_at_queue_start() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    bridge.on_tracklist_add("http://stream/x.mp3", NO_TRACK, False)
+    await _drain(bridge)
+    client.addid.assert_awaited_once_with("http://stream/x.mp3", 0)
+    client.playid.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_after_known_track() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(
+        client, queue=[{"id": "1", "pos": "0"}, {"id": "2", "pos": "1"}],
+    )
+    bridge.on_tracklist_add(
+        "file:///srv/music/a/b.flac", "/org/mpris/MediaPlayer2/Track/1", False,
+    )
+    await _drain(bridge)
+    client.addid.assert_awaited_once_with("a/b.flac", 1)
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_unknown_after_appends() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client, queue=[{"id": "1"}])
+    bridge.on_tracklist_add(
+        "http://stream/x.mp3", "/org/mpris/MediaPlayer2/Track/99", False,
+    )
+    await _drain(bridge)
+    client.addid.assert_awaited_once_with("http://stream/x.mp3")
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_set_as_current_plays_new_id() -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    bridge.on_tracklist_add("http://stream/x.mp3", NO_TRACK, True)
+    await _drain(bridge)
+    client.playid.assert_awaited_once_with(9)
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_unmappable_uri_is_noop(caplog) -> None:
+    client = _tracklist_client()
+    bridge = _tracklist_callback_bridge(client)
+    with caplog.at_level(logging.WARNING):
+        bridge.on_tracklist_add("file:///outside/library.mp3", NO_TRACK, False)
+    await _drain(bridge)
+    client.addid.assert_not_awaited()
+    assert any("AddTrack" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_on_tracklist_add_no_client_is_noop() -> None:
+    bridge = _tracklist_callback_bridge(None)
+    bridge.on_tracklist_add("http://stream/x.mp3", NO_TRACK, False)
+    assert bridge.bg_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_on_get_tracks_metadata_from_cached_queue() -> None:
+    bridge = _tracklist_callback_bridge(
+        _tracklist_client(),
+        queue=[{"id": "1", "title": "a"}, {"id": "2", "title": "b"}],
+    )
+    out = bridge.on_get_tracks_metadata([
+        "/org/mpris/MediaPlayer2/Track/2",
+        "/org/mpris/MediaPlayer2/Track/99",  # unknown: omitted per spec
+    ])
+    assert len(out) == 1
+    assert out[0]["xesam:title"].value == "b"
+    assert out[0]["mpris:trackid"].value == "/org/mpris/MediaPlayer2/Track/2"
