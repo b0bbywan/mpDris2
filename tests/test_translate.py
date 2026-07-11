@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mpd2mpris.translate import (
+    NO_TRACK,
     artist_matches,
     first,
     loop_status_from,
@@ -17,7 +18,10 @@ from mpd2mpris.translate import (
     parse_volume,
     playback_status_from,
     song_url,
+    songid_from,
     split_title,
+    to_mpd_uri,
+    track_id,
 )
 
 
@@ -290,3 +294,63 @@ def test_song_url_url_encodes_specials() -> None:
     assert song_url(song, Path("/srv/music"), ["http://"]) == (
         "file:///srv/music/Artist/Album%2001/Song%20%231.flac"
     )
+
+
+# --- track ids --------------------------------------------------------------
+
+def test_track_id_from_songid() -> None:
+    assert track_id("42") == "/org/mpris/MediaPlayer2/Track/42"
+    assert track_id(7) == "/org/mpris/MediaPlayer2/Track/7"
+
+
+def test_songid_from_roundtrip() -> None:
+    assert songid_from(track_id("42")) == 42
+
+
+def test_songid_from_no_track_sentinel() -> None:
+    assert songid_from(NO_TRACK) is None
+
+
+def test_songid_from_foreign_path() -> None:
+    assert songid_from("/org/mpris/MediaPlayer2/Playlists/1") is None
+
+
+def test_songid_from_non_numeric() -> None:
+    assert songid_from("/org/mpris/MediaPlayer2/Track/abc") is None
+
+
+# --- to_mpd_uri -------------------------------------------------------------
+
+def test_to_mpd_uri_file_under_music_dir() -> None:
+    assert to_mpd_uri(
+        "file:///srv/music/Artist/Album/Song.flac", Path("/srv/music"), ["http://"],
+    ) == "Artist/Album/Song.flac"
+
+
+def test_to_mpd_uri_unquotes_specials() -> None:
+    assert to_mpd_uri(
+        "file:///srv/music/Album%2001/Song%20%231.flac", Path("/srv/music"), ["http://"],
+    ) == "Album 01/Song #1.flac"
+
+
+def test_to_mpd_uri_file_outside_library_rejected() -> None:
+    assert to_mpd_uri("file:///home/x/song.mp3", Path("/srv/music"), ["http://"]) == ""
+
+
+def test_to_mpd_uri_file_without_music_dir_rejected() -> None:
+    assert to_mpd_uri("file:///srv/music/a.flac", None, ["http://"]) == ""
+
+
+def test_to_mpd_uri_http_passes_through() -> None:
+    url = "http://stream.example/live.mp3"
+    assert to_mpd_uri(url, Path("/srv/music"), ["http://"]) == url
+
+
+def test_to_mpd_uri_unhandled_scheme_rejected() -> None:
+    assert to_mpd_uri("spotify:track:xyz", Path("/srv/music"), ["http://"]) == ""
+
+
+def test_to_mpd_uri_roundtrips_song_url() -> None:
+    song = {"file": "Artist/Album 01/Song #1.flac"}
+    url = song_url(song, Path("/srv/music"), ["http://"])
+    assert to_mpd_uri(url, Path("/srv/music"), ["http://"]) == song["file"]
