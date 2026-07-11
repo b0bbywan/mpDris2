@@ -65,7 +65,8 @@ class MediaPlayer2(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def HasTrackList(self) -> "b":  # noqa: N802
-        return False
+        # MediaPlayer2TrackList is exported alongside this interface.
+        return True
 
     @dbus_property(access=PropertyAccess.READ)
     def Identity(self) -> "s":  # noqa: N802

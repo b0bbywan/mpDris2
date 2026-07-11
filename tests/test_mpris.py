@@ -24,7 +24,7 @@ def test_root_identity() -> None:
     assert root.Identity == "Music Player Daemon"
     assert root.CanQuit is False
     assert root.CanRaise is False
-    assert root.HasTrackList is False
+    assert root.HasTrackList is True
 
 
 def test_player_defaults() -> None:

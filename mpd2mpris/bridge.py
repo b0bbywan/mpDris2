@@ -37,9 +37,12 @@ from mpd2mpris.mpris import (
     ROOT_PATH,
     MediaPlayer2,
     MediaPlayer2Player,
+    MediaPlayer2TrackList,
 )
 from mpd2mpris.translate import (
     DEFAULT_URL_HANDLERS,
+    NO_TRACK,
+    first,
     loop_status_from,
     mpd_to_mpris,
     parse_elapsed,
@@ -48,6 +51,9 @@ from mpd2mpris.translate import (
     parse_volume,
     playback_status_from,
     song_url,
+    songid_from,
+    to_mpd_uri,
+    track_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +87,46 @@ class BridgeConfig:
 # ``song_url`` …) live in ``mpd2mpris.translate``. What stays here is either
 # stateful (the refresh diff) or a heuristic that's specific to the bridge's
 # refresh cadence (external-seek detection).
+
+
+# Above this many individual adds + removes the diff is reported as one
+# TrackListReplaced instead of a signal flood (playlist load, clear, …).
+_TRACKLIST_DIFF_MAX = 10
+
+
+def _diff_queue(
+    old_ids: list[str], new_ids: list[str],
+) -> tuple[list[tuple[str, str | None]], list[str]] | None:
+    """Diff two queue-id sequences into TrackList signals. Returns
+    ``(added, removed)`` when the change is small and order-preserving:
+    ``removed`` ids first, then ``added`` as ``(id, predecessor-id)``
+    pairs in queue order (predecessor ``None`` = queue start), so each
+    TrackAdded's AfterTrack already exists at emit time. Returns ``None``
+    when surviving entries were reordered (move, shuffle) or the change
+    exceeds ``_TRACKLIST_DIFF_MAX`` — emit one TrackListReplaced instead."""
+    old_set, new_set = set(old_ids), set(new_ids)
+    removed = [i for i in old_ids if i not in new_set]
+    added_ids = {i for i in new_ids if i not in old_set}
+    if len(removed) + len(added_ids) > _TRACKLIST_DIFF_MAX:
+        return None
+    if [i for i in old_ids if i in new_set] != [i for i in new_ids if i in old_set]:
+        return None
+    added = [
+        (sid, new_ids[idx - 1] if idx else None)
+        for idx, sid in enumerate(new_ids)
+        if sid in added_ids
+    ]
+    return added, removed
+
+
+def _queue_ids(queue: list[dict]) -> list[str]:
+    return [first(s["id"]) for s in queue if "id" in s]
+
+
+def _strip_pos(song: dict) -> dict:
+    """A removal shifts every later entry's ``pos``; ignore it when
+    deciding whether a surviving track's metadata really changed."""
+    return {k: v for k, v in song.items() if k != "pos"}
 
 
 def _is_external_seek(old_status: dict, old_time: float, new_pos_s: float, now: float) -> bool:
@@ -130,6 +176,12 @@ class MpdMprisBridge:
         self.last_song: dict = {}
         self.last_time: float = 0.0
 
+        # TrackList state: the cached queue (playlistinfo) and the MPD
+        # queue version it corresponds to (status ``playlist``), so a
+        # refresh only re-fetches the queue when the version moved.
+        self._queue: list[dict] = []
+        self._queue_version: str | None = None
+
         # Pre-resolved configuration (built in cli.py).
         self.host = config.host
         self.port = config.port
@@ -172,6 +224,12 @@ class MpdMprisBridge:
             on_loop_status_set=self.on_loop_status_set,
             on_shuffle_set=self.on_shuffle_set,
             on_get_position=self.on_get_position,
+        )
+        self.tracklist = MediaPlayer2TrackList(
+            on_go_to=self.on_tracklist_goto,
+            on_add_track=self.on_tracklist_add,
+            on_remove_track=self.on_tracklist_remove,
+            on_get_tracks_metadata=self.on_get_tracks_metadata,
         )
 
     # --- Task / error plumbing ------------------------------------------
@@ -283,7 +341,7 @@ class MpdMprisBridge:
         # MPRIS requires the trackid match the currently playing track;
         # if it doesn't, the call is a no-op per spec.
         cur_id = self.last_song.get("id")
-        if cur_id is not None and trackid != f"/org/mpris/MediaPlayer2/Track/{cur_id}":
+        if cur_id is not None and trackid != track_id(cur_id):
             return
         position_s = position_us / 1_000_000
         self._fire(lambda c: c.seekcur(str(position_s)))
@@ -309,6 +367,59 @@ class MpdMprisBridge:
                     await self._mpd_safe(c.single(0))
 
         self._schedule(apply())
+
+    # --- TrackList callbacks ----------------------------------------------
+
+    def on_tracklist_goto(self, trackid: str) -> None:
+        songid = songid_from(trackid)
+        if songid is not None:
+            self._fire(lambda c: c.playid(songid))
+
+    def on_tracklist_remove(self, trackid: str) -> None:
+        songid = songid_from(trackid)
+        if songid is not None:
+            self._fire(lambda c: c.deleteid(songid))
+
+    def on_tracklist_add(self, uri: str, after_track: str, set_as_current: bool) -> None:
+        c = self.client
+        if c is None:
+            return
+        mpd_uri = to_mpd_uri(uri, self.music_dir, self.url_handlers)
+        if not mpd_uri:
+            logger.warning("AddTrack: MPD can't play %r; ignoring", uri)
+            return
+        pos = self._insert_pos(after_track)
+
+        async def add() -> None:
+            args = (mpd_uri,) if pos is None else (mpd_uri, pos)
+            new_id = await self._mpd_safe(c.addid(*args))
+            if set_as_current and new_id is not None:
+                await self._mpd_safe(c.playid(int(new_id)))
+
+        self._schedule(add())
+
+    def _insert_pos(self, after_track: str) -> int | None:
+        """Queue index for AddTrack's AfterTrack: ``NO_TRACK`` gives 0
+        (queue start), a known track gives its index + 1, an unknown
+        path gives ``None`` (append at the end)."""
+        if after_track == NO_TRACK:
+            return 0
+        songid = songid_from(after_track)
+        if songid is not None:
+            for idx, song in enumerate(self._queue):
+                if first(song.get("id")) == str(songid):
+                    return idx + 1
+        return None
+
+    def on_get_tracks_metadata(self, trackids: list[str]) -> list[dict]:
+        # Answered from the cached queue; ids no longer in it are
+        # omitted, per spec ("can be left out ... considered invalid").
+        by_path = {track_id(s["id"]): s for s in self._queue if "id" in s}
+        return [
+            mpd_to_mpris(by_path[tid], self.music_dir, self.url_handlers)
+            for tid in trackids
+            if tid in by_path
+        ]
 
     # --- Metadata + cover -----------------------------------------------
 
@@ -388,6 +499,7 @@ class MpdMprisBridge:
 
         snap = self._snapshot(status, song)
         self._apply_current_state(status, song, snap)
+        await self._refresh_tracklist(status)
 
     def _snapshot(self, status: dict, song: dict) -> _RefreshSnapshot:
         """Capture the previous status/song/time, advance ``self.last_*``
@@ -466,6 +578,70 @@ class MpdMprisBridge:
         self.player.update_capabilities(can_seek="mpris:length" in base)
         self._schedule_cover(song, status, base)
 
+    # --- TrackList refresh: MPD queue -> MPRIS TrackList ------------------
+
+    async def _refresh_tracklist(self, status: dict) -> None:
+        """Re-fetch the queue and sync the TrackList interface, but only
+        when the queue version in ``status`` moved since the last sync."""
+        c = self.client
+        version = status.get("playlist")
+        if c is None or version == self._queue_version:
+            return
+        queue = await self._mpd_safe(c.playlistinfo())
+        if queue is None:
+            return  # version stays put -> retried on the next refresh
+        self._queue_version = version
+        self._sync_tracklist(list(queue), status)
+
+    def _sync_tracklist(self, queue: list[dict], status: dict) -> None:
+        """Diff the cached queue against ``queue`` and emit the matching
+        TrackList signals: individual TrackAdded/TrackRemoved for a small
+        order-preserving change, one TrackListReplaced otherwise, and
+        TrackMetadataChanged for surviving entries whose tags changed
+        (web-radio ICY title updates)."""
+        old_queue, self._queue = self._queue, queue
+        old_ids, new_ids = _queue_ids(old_queue), _queue_ids(queue)
+        self.tracklist.update_tracks([track_id(i) for i in new_ids])
+
+        ops = _diff_queue(old_ids, new_ids)
+        if ops is None:
+            current = status.get("songid")
+            self.tracklist.emit_track_list_replaced(
+                track_id(current) if current else NO_TRACK,
+            )
+            return
+
+        added, removed = ops
+        for sid in removed:
+            self.tracklist.emit_track_removed(track_id(sid))
+        by_id = {first(s["id"]): s for s in queue if "id" in s}
+        for sid, after in added:
+            self.tracklist.emit_track_added(
+                mpd_to_mpris(by_id[sid], self.music_dir, self.url_handlers),
+                track_id(after) if after is not None else NO_TRACK,
+            )
+        old_by_id = {first(s["id"]): s for s in old_queue if "id" in s}
+        added_ids = {sid for sid, _ in added}
+        for sid, song in by_id.items():
+            old_song = old_by_id.get(sid)
+            if sid in added_ids or old_song is None:
+                continue
+            if _strip_pos(song) != _strip_pos(old_song):
+                self.tracklist.emit_track_metadata_changed(
+                    track_id(sid),
+                    mpd_to_mpris(song, self.music_dir, self.url_handlers),
+                )
+
+    def _reset_tracklist_state(self) -> None:
+        """Empty the TrackList — for reconnects, so subscribers see an
+        empty queue while MPD is away and the next sync starts fresh."""
+        had_tracks = bool(self._queue)
+        self._queue = []
+        self._queue_version = None
+        if had_tracks:
+            self.tracklist.update_tracks([])
+            self.tracklist.emit_track_list_replaced(NO_TRACK)
+
     # --- Lifecycle ------------------------------------------------------
 
     async def setup(self) -> None:
@@ -473,6 +649,7 @@ class MpdMprisBridge:
         well-known name. The bus comes pre-built from cli.py."""
         self.bus.export(ROOT_PATH, MediaPlayer2())
         self.bus.export(ROOT_PATH, self.player)
+        self.bus.export(ROOT_PATH, self.tracklist)
         await self.bus.request_name(BUS_NAME)
         logger.info("D-Bus name acquired: %s", BUS_NAME)
 
@@ -501,6 +678,7 @@ class MpdMprisBridge:
                 continue
             self.caps = mpd_client.capabilities(cmds)
             logger.info("MPD capabilities: %s", ",".join(k for k, v in self.caps.items() if v))
+            self.tracklist.update_can_edit(self.caps["queue_edit"])
             self.cover_finder.update_capabilities(
                 can_readpicture=self.caps["readpicture"],
                 can_albumart=self.caps["albumart"],
@@ -552,6 +730,7 @@ class MpdMprisBridge:
             self.player.update_playback_status("Stopped")
             self.player.update_metadata({})
             self._reset_cover_state()
+            self._reset_tracklist_state()
 
     async def close(self) -> None:
         """Drain in-flight tasks and release the bus name. The bus
