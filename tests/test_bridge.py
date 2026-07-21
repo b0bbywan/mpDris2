@@ -19,6 +19,7 @@ from dbus_fast import Variant
 
 from mpd2mpris.bridge import (
     MpdMprisBridge,
+    _decoder_mime_types,
     _diff_queue,
     _is_external_seek,
     _RefreshSnapshot,
@@ -1218,3 +1219,43 @@ def test_apply_no_last_loaded_playlist_is_inactive() -> None:
     bridge = _apply_bridge()
     bridge._apply_current_state({"state": "play"}, {"id": "1"}, _snap())
     bridge.playlists.update_active_playlist.assert_called_once_with(None)
+
+
+# --- _uri_schemes / _decoder_mime_types ------------------------------------
+
+def _schemes_bridge(*, music_dir, url_handlers):
+    bridge = MpdMprisBridge.__new__(MpdMprisBridge)
+    bridge.music_dir = music_dir
+    bridge.url_handlers = url_handlers
+    return bridge
+
+
+def test_uri_schemes_strips_separator_and_adds_file() -> None:
+    bridge = _schemes_bridge(
+        music_dir=Path("/srv/music"),
+        url_handlers=["http://", "https://", "mms://"],
+    )
+    assert bridge._uri_schemes() == ["http", "https", "mms", "file"]
+
+
+def test_uri_schemes_no_music_dir_omits_file() -> None:
+    bridge = _schemes_bridge(
+        music_dir=None,
+        url_handlers=["http://", "file://"],
+    )
+    assert bridge._uri_schemes() == ["http"]
+
+
+def test_decoder_mime_types_flattens_and_dedups() -> None:
+    decoders = [
+        {"plugin": "flac", "mime_type": ["audio/flac", "audio/x-flac"]},
+        {"plugin": "mad", "mime_type": "audio/mpeg"},
+        {"plugin": "vorbis", "mime_type": ["audio/ogg", "audio/mpeg"]},
+        {"plugin": "pcm"},
+    ]
+    assert _decoder_mime_types(decoders) == [
+        "audio/flac",
+        "audio/x-flac",
+        "audio/mpeg",
+        "audio/ogg",
+    ]
