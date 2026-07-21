@@ -46,6 +46,8 @@ class MediaPlayer2(ServiceInterface):
 
     def __init__(self) -> None:
         super().__init__(MEDIA_PLAYER_IFACE)
+        self._uri_schemes: list[str] = []
+        self._mime_types: list[str] = []
 
     @method()
     def Raise(self):  # noqa: N802
@@ -79,14 +81,28 @@ class MediaPlayer2(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def SupportedUriSchemes(self) -> "as":  # noqa: N802
-        # Filled at daemon startup from MPD's ``urlhandlers`` command if
-        # we ever want to advertise OpenUri. For now MPD's local URI
-        # scheme isn't MPRIS-portable, so leave empty.
-        return []
+        # Bare scheme names ("http", "file") — the schemes
+        # TrackList.AddTrack accepts, fed from MPD's ``urlhandlers``.
+        return self._uri_schemes
 
     @dbus_property(access=PropertyAccess.READ)
     def SupportedMimeTypes(self) -> "as":  # noqa: N802
-        return []
+        # Fed from MPD's ``decoders`` command.
+        return self._mime_types
+
+    def update_uri_schemes(self, schemes: list[str]) -> None:
+        schemes = list(schemes)
+        if schemes == self._uri_schemes:
+            return
+        self._uri_schemes = schemes
+        self.emit_properties_changed({"SupportedUriSchemes": schemes})
+
+    def update_mime_types(self, mime_types: list[str]) -> None:
+        mime_types = list(mime_types)
+        if mime_types == self._mime_types:
+            return
+        self._mime_types = mime_types
+        self.emit_properties_changed({"SupportedMimeTypes": mime_types})
 
 
 class MediaPlayer2Player(ServiceInterface):

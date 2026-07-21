@@ -134,6 +134,20 @@ def _strip_pos(song: dict) -> dict:
     return {k: v for k, v in song.items() if k != "pos"}
 
 
+def _decoder_mime_types(decoders: list[dict]) -> list[str]:
+    """Unique MIME types across MPD ``decoders`` plugin entries, in
+    order: ``[{"plugin": "flac", "mime_type": ["audio/flac", ...]},
+    ...]`` gives ``["audio/flac", ...]``. python-mpd2 leaves a
+    single-valued ``mime_type`` as a plain string; both shapes are
+    accepted."""
+    seen: dict[str, None] = {}
+    for dec in decoders:
+        mt = dec.get("mime_type", [])
+        for mime in [mt] if isinstance(mt, str) else mt:
+            seen.setdefault(mime)
+    return list(seen)
+
+
 def _is_external_seek(old_status: dict, old_time: float, new_pos_s: float, now: float) -> bool:
     """Return True when the elapsed time deviates from what linear
     playback since ``old_time`` would predict by more than 0.6s — the
@@ -220,6 +234,7 @@ class MpdMprisBridge:
         self._cdprev = config.cdprev
         self._no_reconnect = config.no_reconnect
 
+        self.root = MediaPlayer2()
         self.player = MediaPlayer2Player(
             on_play=self.on_play,
             on_pause=self.on_pause,
@@ -713,12 +728,23 @@ class MpdMprisBridge:
             self.tracklist.update_tracks([])
             self.tracklist.emit_track_list_replaced(NO_TRACK)
 
+    def _uri_schemes(self) -> list[str]:
+        """SupportedUriSchemes for the root interface: with handlers
+        ``["http://", "https://"]`` and a music_dir this is ``["http",
+        "https", "file"]`` — exactly what ``to_mpd_uri`` accepts.
+        ``file`` is advertised only alongside a music_dir, since mapping
+        a file:// URI into the library requires one."""
+        schemes = [h.removesuffix("://") for h in self.url_handlers if h != "file://"]
+        if self.music_dir:
+            schemes.append("file")
+        return schemes
+
     # --- Lifecycle ------------------------------------------------------
 
     async def setup(self) -> None:
         """Export MPRIS interfaces on the injected bus and request the
         well-known name. The bus comes pre-built from cli.py."""
-        self.bus.export(ROOT_PATH, MediaPlayer2())
+        self.bus.export(ROOT_PATH, self.root)
         self.bus.export(ROOT_PATH, self.player)
         self.bus.export(ROOT_PATH, self.tracklist)
         self.bus.export(ROOT_PATH, self.playlists)
@@ -781,6 +807,13 @@ class MpdMprisBridge:
                 self.url_handlers = list(await new_client.urlhandlers())
             except (mpd.CommandError, mpd.ConnectionError, OSError):
                 self.url_handlers = list(DEFAULT_URL_HANDLERS)
+            self.root.update_uri_schemes(self._uri_schemes())
+
+            try:
+                decoders = list(await new_client.decoders())
+            except (mpd.CommandError, mpd.ConnectionError, OSError):
+                decoders = []
+            self.root.update_mime_types(_decoder_mime_types(decoders))
 
             await self.refresh()
             await self._refresh_playlists()

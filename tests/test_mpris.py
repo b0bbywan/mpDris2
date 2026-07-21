@@ -32,6 +32,20 @@ def test_root_identity() -> None:
     assert root.HasTrackList is True
 
 
+def test_root_uri_schemes_and_mime_types_start_empty() -> None:
+    root = MediaPlayer2()
+    assert root.SupportedUriSchemes == []
+    assert root.SupportedMimeTypes == []
+
+
+def test_root_update_uri_schemes_and_mime_types() -> None:
+    root = MediaPlayer2()
+    root.update_uri_schemes(["http", "https", "file"])
+    root.update_mime_types(["audio/flac", "audio/mpeg"])
+    assert root.SupportedUriSchemes == ["http", "https", "file"]
+    assert root.SupportedMimeTypes == ["audio/flac", "audio/mpeg"]
+
+
 def test_player_defaults() -> None:
     p = MediaPlayer2Player()
     assert p.PlaybackStatus == "Stopped"
