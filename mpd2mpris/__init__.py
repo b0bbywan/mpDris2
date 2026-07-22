@@ -1,4 +1,4 @@
-__version__ = "0.13.0b1"
+__version__ = "0.13.0"
 
 # Project identity, shared by the HTTP User-Agent (``_http``) and the
 # MusicBrainz client (``musicbrainz.set_useragent``).
