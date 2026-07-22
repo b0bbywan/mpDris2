@@ -1,3 +1,17 @@
+mpd2mpris (0.13.0) unstable; urgency=medium
+
+  * New MPRIS TrackList interface exposing the MPD queue: queue changes
+    are diffed into TrackAdded/TrackRemoved signals (or one
+    TrackListReplaced), with AddTrack/RemoveTrack/GoTo wired to MPD and
+    gated on the server's queue-edit capability.
+  * New MPRIS Playlists interface exposing MPD stored playlists;
+    ActivePlaylist follows the queue's last loaded playlist (MPD >= 0.24).
+  * Root interface now advertises SupportedUriSchemes (from MPD's
+    urlhandlers, plus file when a music_dir is configured) and
+    SupportedMimeTypes (from MPD's decoders) instead of empty lists.
+
+ -- Mathieu Réquillart <mathieu.requillart@gmail.com>  Wed, 22 Jul 2026 18:23:33 +0000
+
 mpd2mpris (0.12.0) unstable; urgency=medium
 
   * Rename project mpDris2 -> mpd2mpris (in agreement with the original
