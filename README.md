@@ -32,8 +32,12 @@ mpd2mpris runs in the user session and monitors a local or distant mpd server.
 
 ## Features
 
-- Full MPRIS 2 interface (playback control, metadata, seek, volume) for
+- Full MPRIS 2.2 surface (playback control, metadata, seek, volume) for
   any MPRIS client: `playerctl`, media keys, desktop applets.
+- The MPD queue exposed as the MPRIS TrackList: clients can list, add,
+  remove and jump to queue tracks over D-Bus.
+- MPD stored playlists exposed via the MPRIS Playlists interface;
+  `ActivePlaylist` follows the last loaded playlist (MPD >= 0.24).
 - Pure asyncio + dbus-fast: single event loop, no threads, no GLib.
 - Local or remote MPD, with automatic reconnect and capability probing.
 - A 7-step cover-art pipeline that resolves artwork for tagged files,
@@ -214,8 +218,9 @@ MPRIS client fetches it, nothing is downloaded or cached to disk.
   Debian box into a hi-fi network receiver. It bundles Bluetooth A2DP,
   AirPlay, Snapcast multi-room, UPnP/DLNA, Spotify Connect, automatic CD
   playback and web radio on top of MPD. Odio runs mpd2mpris to expose its
-  MPD over MPRIS2, including the cover pipeline that resolves artwork for
-  CD and web-radio playback.
+  MPD over MPRIS2: playback control, the queue and stored playlists
+  (TrackList/Playlists), and the cover pipeline that resolves artwork
+  for CD and web-radio playback.
 
 # Contributing
 
